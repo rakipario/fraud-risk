@@ -1,7 +1,10 @@
 import re
 from datetime import datetime
 from io import BytesIO
-
+import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
@@ -25,6 +28,223 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
+
+
+def load_data(uploaded_file, cache_dir=".data_cache"):
+    """Load data from uploaded file using DuckDB for memory efficiency"""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(exist_ok=True)
+    
+    # Create a unique cache key based on file name and last modified time
+    file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+    parquet_path = cache_dir / f"{hash(file_id)}.parquet"
+    
+    # Convert to parquet if not already done
+    if not parquet_path.exists():
+        if uploaded_file.name.endswith('.xlsx'):
+            # Read first 1000 rows to infer schema
+            df_sample = pd.read_excel(uploaded_file, nrows=1000)
+            schema = pa.Schema.from_pandas(df_sample)
+            
+            # Read and write in chunks
+            chunks = pd.read_excel(uploaded_file, chunksize=10000)
+            with pq.ParquetWriter(str(parquet_path), schema) as writer:
+                for chunk in chunks:
+                    table = pa.Table.from_pandas(chunk, schema=schema)
+                    writer.write_table(table)
+        else:
+            # For CSV/other formats
+            chunks = pd.read_csv(uploaded_file, chunksize=10000)
+            first_chunk = True
+            for chunk in chunks:
+                if first_chunk:
+                    schema = pa.Schema.from_pandas(chunk)
+                    writer = pq.ParquetWriter(str(parquet_path), schema)
+                    first_chunk = False
+                table = pa.Table.from_pandas(chunk, schema=schema)
+                writer.write_table(table)
+            writer.close()
+    
+    # Connect to DuckDB and register the parquet file
+    con = duckdb.connect(database=':memory:')
+    con.execute(f"""
+        CREATE OR REPLACE TABLE loan_data AS 
+        SELECT * FROM read_parquet('{str(parquet_path)}')
+    """)
+    return con
+
+
+def process_data_chunked(con, process_func, batch_size=10000):
+    """Process data in chunks using DuckDB"""
+    total_rows = con.execute("SELECT COUNT(*) FROM loan_data").fetchone()[0]
+    results = []
+    
+    for offset in range(0, total_rows, batch_size):
+        df_chunk = con.execute(f"""
+            SELECT * FROM loan_data 
+            ORDER BY rowid 
+            LIMIT {batch_size} OFFSET {offset}
+        """).fetchdf()
+        
+        if df_chunk.empty:
+            break
+            
+        # Process the chunk
+        result = process_func(df_chunk)
+        if result is not None:
+            results.append(result)
+    
+    # Combine results if needed
+    if results and isinstance(results[0], pd.DataFrame):
+        return pd.concat(results, ignore_index=True)
+    return results
+
+
+def train_model_chunked(con, X_cols, y_col, batch_size=10000, thorough_training=False):
+    """Train model using chunked data"""
+    # Get total rows for progress tracking
+    total_rows = con.execute("SELECT COUNT(*) FROM loan_data").fetchone()[0]
+    
+    # Get feature types for preprocessing
+    sample = con.execute(f"SELECT * FROM loan_data LIMIT 1").fetchdf()
+    numeric_features = sample[X_cols].select_dtypes(include=['int64', 'float64']).columns.tolist()
+    categorical_features = list(set(X_cols) - set(numeric_features))
+    
+    # Preprocessing
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median'))
+    ])
+    
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features)
+        ])
+    
+    # Initialize model
+    if thorough_training:
+        model = LGBMClassifier(
+            n_estimators=200,
+            learning_rate=0.05,
+            random_state=42,
+            n_jobs=-1,
+            verbose=-1
+        )
+    else:
+        model = LGBMClassifier(
+            n_estimators=100,
+            learning_rate=0.1,
+            random_state=42,
+            n_jobs=-1,
+            verbose=-1
+        )
+    
+    # Create progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    try:
+        # Train in chunks
+        X_chunks = []
+        y_chunks = []
+        
+        for offset in range(0, total_rows, batch_size):
+            # Update progress
+            progress = min((offset + batch_size) / total_rows, 1.0)
+            progress_bar.progress(progress)
+            status_text.text(f"Processing batch {offset//batch_size + 1}...")
+            
+            # Get chunk
+            query = f"""
+                SELECT * FROM loan_data 
+                ORDER BY rowid 
+                LIMIT {batch_size} OFFSET {offset}
+            """
+            chunk = con.execute(query).fetchdf()
+            
+            if chunk.empty:
+                break
+                
+            X_chunk = chunk[X_cols]
+            y_chunk = chunk[y_col]
+            
+            if thorough_training:
+                # For thorough training, collect all data first
+                X_chunks.append(X_chunk)
+                y_chunks.append(y_chunk)
+            else:
+                # For regular training, fit incrementally
+                if offset == 0:
+                    model = Pipeline([
+                        ('preprocessor', preprocessor),
+                        ('classifier', model)
+                    ])
+                    model.fit(X_chunk, y_chunk)
+                else:
+                    # For models that support partial_fit
+                    if hasattr(model, 'partial_fit'):
+                        X_processed = preprocessor.transform(X_chunk)
+                        model.partial_fit(X_processed, y_chunk, classes=[0, 1])
+                    else:
+                        # Retrain on accumulated data if partial_fit not available
+                        X_all = pd.concat([X_all, X_chunk])
+                        y_all = pd.concat([y_all, y_chunk])
+                        model.fit(X_all, y_all)
+        
+        if thorough_training:
+            # Combine all data for thorough training
+            X_all = pd.concat(X_chunks)
+            y_all = pd.concat(y_chunks)
+            
+            # Update status
+            status_text.text("Performing thorough hyperparameter search...")
+            
+            # Define parameter grid for RandomizedSearchCV
+            param_dist = {
+                'classifier__n_estimators': [100, 200, 300],
+                'classifier__learning_rate': [0.01, 0.05, 0.1],
+                'classifier__max_depth': [3, 5, 7],
+                'classifier__min_child_samples': [20, 50, 100],
+                'classifier__subsample': [0.8, 0.9, 1.0],
+                'classifier__colsample_bytree': [0.8, 0.9, 1.0]
+            }
+            
+            # Create pipeline for RandomizedSearchCV
+            model = Pipeline([
+                ('preprocessor', preprocessor),
+                ('classifier', LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1))
+            ])
+            
+            # Perform randomized search with cross-validation
+            search = RandomizedSearchCV(
+                model,
+                param_distributions=param_dist,
+                n_iter=10,
+                cv=3,
+                scoring='roc_auc',
+                n_jobs=-1,
+                verbose=1,
+                random_state=42
+            )
+            
+            # Fit the model with progress updates
+            search.fit(X_all, y_all)
+            model = search.best_estimator_
+            
+            # Update status
+            status_text.text(f"Best parameters: {search.best_params_}")
+        
+        return model
+        
+    finally:
+        # Clean up progress bar
+        progress_bar.empty()
+        status_text.empty()
 
 
 def parse_emp_length(val):
@@ -925,60 +1145,72 @@ def main():
                         "cv_pr_auc_mean": cv_pr_auc,
                         "required_columns": numeric_features + categorical_features,
                     }
-
-                    st.session_state.artifacts = artifacts
-                    try:
-                        joblib.dump(artifacts, "fraud_detection_model.joblib")
-                    except Exception:
-                        pass
-
-                    progress.progress(100)
-                    status.write("Done")
-
-                    st.markdown("### Results")
-                    col1, col2 = st.columns([1, 1])
-
-                    with col1:
-                        st.write("Metrics")
-                        metrics_table = pd.DataFrame([metrics])
-                        if cv_auc is not None:
-                            metrics_table["CV_ROC_AUC_Mean"] = cv_auc
-                        if cv_pr_auc is not None:
-                            metrics_table["CV_PR_AUC_Mean"] = cv_pr_auc
-                        metrics_table["Threshold"] = threshold
-                        st.dataframe(metrics_table, use_container_width=True)
-
-                    with col2:
-                        cm = confusion_matrix(y_val, y_pred_val)
-                        cm_df = pd.DataFrame(
-                            cm,
-                            index=["Actual Fully Paid", "Actual Defaulted"],
-                            columns=["Pred Fully Paid", "Pred Defaulted"],
-                        )
-                        fig_cm = px.imshow(
-                            cm_df,
-                            text_auto=True,
-                            title="Confusion Matrix (Validation)",
-                            color_continuous_scale="Blues",
-                        )
-                        st.plotly_chart(fig_cm, use_container_width=True)
-
-                    with st.expander("ROC & Precision-Recall curves"):
                         try:
-                            fpr, tpr, _ = roc_curve(y_val, y_proba_val)
-                            fig_roc = go.Figure()
-                            fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name="ROC"))
-                            fig_roc.add_trace(
-                                go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random", line=dict(dash="dash"))
-                            )
-                            fig_roc.update_layout(
-                                title="ROC Curve (Validation)",
-                                xaxis_title="False Positive Rate",
-                                yaxis_title="True Positive Rate",
-                                height=380,
-                            )
-                            st.plotly_chart(fig_roc, use_container_width=True)
-
+                            # Display loading state
+                            with st.spinner('Loading and processing data (this may take a while)...'):
+                                # Load data using memory-efficient method
+                                con = load_data(train_file)
+                                
+                                # Get column names and sample data for display
+                                columns = con.execute("DESCRIBE loan_data").fetchdf()['column_name'].tolist()
+                                sample_data = con.execute("SELECT * FROM loan_data LIMIT 5").fetchdf()
+                                
+                                # Clean and engineer features in chunks
+                                def process_chunk(chunk):
+                                    chunk = clean_dataframe(chunk)
+                                    return engineer_fraud_features(chunk)
+                                
+                                # Process data in chunks
+                                processed_data = process_data_chunked(con, process_chunk)
+                                
+                                # Get the updated column names after feature engineering
+                                sample_processed = process_chunk(sample_data)
+                                
+                            # Display data info
+                            st.subheader("Data Preview")
+                            st.write(f"Shape: {con.execute('SELECT COUNT(*) FROM loan_data').fetchone()[0]} rows, {len(sample_processed.columns)} columns")
+                            st.dataframe(sample_processed)
+                            
+                            # Model training options
+                            st.subheader("2. Model Training Options")
+                            thorough_training = st.checkbox("Enable thorough training (slower but more accurate)", 
+                                                         help="Uses RandomizedSearchCV for hyperparameter tuning")
+                            
+                            # Train button
+                            train_btn = st.button("Train Model")
+                            
+                            if train_btn:
+                                with st.spinner('Training model (this may take a while)...'):
+                                    try:
+                                        # Get column names for features and target
+                                        y_col = 'is_default'
+                                        X_cols = [c for c in sample_processed.columns if c not in [y_col, 'borrower_id']]
+                                        
+                                        # Train model using chunked data
+                                        model = train_model_chunked(
+                                            con, 
+                                            X_cols, 
+                                            y_col, 
+                                            thorough_training=thorough_training
+                                        )
+                                        
+                                        # Save model
+                                        joblib.dump(model, 'fraud_detection_model.joblib')
+                                        st.success('Model trained and saved successfully!')
+                                        
+                                        # Display model info
+                                        if hasattr(model, 'best_params_') and thorough_training:
+                                            st.subheader("Best Parameters from Tuning")
+                                            st.json(model.best_params_)
+                                        
+                                    except Exception as e:
+                                        st.error(f"Error during training: {str(e)}")
+                                        st.exception(e)
+                                    finally:
+                                        # Clean up DuckDB connection
+                                        if 'con' in locals():
+                                            con.close()
+                                            
                             prec, rec, _ = precision_recall_curve(y_val, y_proba_val)
                             fig_pr = go.Figure()
                             fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="PR"))
