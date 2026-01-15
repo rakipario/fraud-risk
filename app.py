@@ -178,7 +178,7 @@ def clean_dataframe(df, use_duckdb=False, conn=None):
 def clean_dataframe_duckdb(conn):
     """Memory-efficient cleaning using DuckDB SQL operations"""
     # Create cleaned table with SQL transformations
-    conn.execute("""
+    conn.execute(r"""
         CREATE OR REPLACE TABLE data_cleaned AS
         SELECT 
             *,
@@ -891,7 +891,7 @@ def main():
                     class_counts = y.value_counts().rename({0: "Fully Paid", 1: "Defaulted"}).reset_index()
                     class_counts.columns = ["class", "count"]
                     fig_class = px.bar(class_counts, x="class", y="count", title="Class distribution")
-                    st.plotly_chart(fig_class, use_container_width=False)
+                    st.plotly_chart(fig_class, use_container_width=True)
 
                     st.markdown("### Data analysis & fraud indicators")
                     cat_min = st.slider(
@@ -938,7 +938,7 @@ def main():
                                 orientation="h",
                                 title="Engineered fraud indicators (lift vs base default rate)",
                             )
-                            st.plotly_chart(fig_flags, use_container_width=False)
+                            st.plotly_chart(fig_flags, use_container_width=True)
 
                     with st.expander("Numeric differences: defaulters vs payers"):
                         if report["numeric_diff"].empty:
@@ -955,7 +955,7 @@ def main():
                             plot_df = plot_df.dropna()
                             if len(plot_df) > 0:
                                 fig_box = px.box(plot_df, x="class", y="value", title=f"{top_feature} distribution")
-                                st.plotly_chart(fig_box, use_container_width=False)
+                                st.plotly_chart(fig_box, use_container_width=True)
 
                     with st.expander("Categorical differences: high-risk categories"):
                         if report["categorical_risk"].empty:
@@ -1120,7 +1120,7 @@ def main():
                                     title="Confusion Matrix (Validation)",
                                     color_continuous_scale="Blues",
                                 )
-                                st.plotly_chart(fig_cm, use_container_width=False)
+                                st.plotly_chart(fig_cm, use_container_width=True)
 
                             with st.expander("ROC & Precision-Recall curves"):
                                 try:
@@ -1136,7 +1136,7 @@ def main():
                                         yaxis_title="True Positive Rate",
                                         height=380,
                                     )
-                                    st.plotly_chart(fig_roc, use_container_width=False)
+                                    st.plotly_chart(fig_roc, use_container_width=True)
 
                                     prec, rec, _ = precision_recall_curve(y_val, y_proba_val)
                                     fig_pr = go.Figure()
@@ -1147,7 +1147,7 @@ def main():
                                         yaxis_title="Precision",
                                         height=380,
                                     )
-                                    st.plotly_chart(fig_pr, use_container_width=False)
+                                    st.plotly_chart(fig_pr, use_container_width=True)
                                 except Exception as e:
                                     st.info(f"Could not plot curves: {e}")
 
@@ -1164,7 +1164,7 @@ def main():
                                     fi = pd.DataFrame({"feature": feature_names, "importance": importances})
                                     fi = fi.sort_values("importance", ascending=False).head(30)
                                     fig_fi = px.bar(fi, x="importance", y="feature", orientation="h", title="Top feature importances")
-                                    st.plotly_chart(fig_fi, use_container_width=False)
+                                    st.plotly_chart(fig_fi, use_container_width=True)
                                 except Exception:
                                     pass
                             
