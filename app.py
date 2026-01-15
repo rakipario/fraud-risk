@@ -248,6 +248,153 @@ def engineer_fraud_features(df, copy=True):
         inc = pd.to_numeric(df["annual_inc"], errors="coerce")
         df["loan_to_income"] = loan / (inc + 1)
 
+    if "term_months" in df.columns:
+        term = pd.to_numeric(df["term_months"], errors="coerce")
+        df["term_is_60"] = (term.fillna(0) >= 60).astype(int)
+
+    if "home_ownership" in df.columns:
+        ho = df["home_ownership"].astype(str).str.strip().str.upper()
+        df["home_ownership_is_rent"] = (ho == "RENT").astype(int)
+
+    if "purpose" in df.columns:
+        purpose = df["purpose"].astype(str).str.strip().str.upper()
+        df["purpose_is_house"] = (purpose == "HOUSE").astype(int)
+        df["purpose_is_small_business"] = (purpose == "SMALL_BUSINESS").astype(int)
+        df["purpose_is_debt_consolidation"] = (purpose == "DEBT_CONSOLIDATION").astype(int)
+
+    if "addr_state" in df.columns:
+        st_code = df["addr_state"].astype(str).str.strip().str.upper()
+        high_risk_states = {"AZ", "PA", "NM", "NV", "UT"}
+        df["high_risk_state"] = st_code.isin(high_risk_states).astype(int)
+
+    velocity_cols = [
+        "acc_open_past_24mths",
+        "num_tl_op_past_12m",
+        "open_rv_24m",
+        "inq_last_12m",
+        "inq_last_6mths",
+    ]
+    present_velocity = [c for c in velocity_cols if c in df.columns]
+    if present_velocity:
+        parts = []
+        for c in present_velocity:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if c == "acc_open_past_24mths":
+                parts.append(s / 24.0)
+            elif c == "num_tl_op_past_12m":
+                parts.append(s / 12.0)
+            elif c == "open_rv_24m":
+                parts.append(s / 24.0)
+            elif c == "inq_last_12m":
+                parts.append(s / 12.0)
+            elif c == "inq_last_6mths":
+                parts.append(s / 6.0)
+            else:
+                parts.append(s)
+        df["credit_velocity_score"] = pd.concat(parts, axis=1).sum(axis=1).astype(np.float32)
+
+    if "mo_sin_rcnt_tl" in df.columns:
+        mo_recent = pd.to_numeric(df["mo_sin_rcnt_tl"], errors="coerce")
+        df["recent_trade_within_6m"] = (mo_recent.fillna(9999) <= 6).astype(int)
+
+    util_cols = ["revol_util", "bc_util", "percent_bc_gt_75", "all_util", "il_util"]
+    present_util = [c for c in util_cols if c in df.columns]
+    if present_util:
+        util_parts = [pd.to_numeric(df[c], errors="coerce") for c in present_util]
+        util_mean = pd.concat(util_parts, axis=1).mean(axis=1)
+        df["utilization_stress"] = (util_mean / 100.0).astype(np.float32)
+
+    if "emp_length_years" in df.columns:
+        emp = pd.to_numeric(df["emp_length_years"], errors="coerce")
+        df["employment_lt_1yr"] = (emp.fillna(999) < 1).astype(int)
+        df["employment_ge_10yr"] = (emp.fillna(0) >= 10).astype(int)
+
+    if "credit_history_months" in df.columns:
+        ch = pd.to_numeric(df["credit_history_months"], errors="coerce")
+        df["credit_history_short"] = (ch.fillna(999999) < 60).astype(int)
+        df["credit_history_long"] = (ch.fillna(0) >= 120).astype(int)
+
+    if "avg_cur_bal" in df.columns:
+        bal = pd.to_numeric(df["avg_cur_bal"], errors="coerce")
+        df["avg_cur_bal_low"] = (bal.fillna(np.inf) < 12000).astype(int)
+
+    if "tot_hi_cred_lim" in df.columns:
+        lim = pd.to_numeric(df["tot_hi_cred_lim"], errors="coerce")
+        df["tot_hi_cred_lim_low"] = (lim.fillna(np.inf) < 170000).astype(int)
+
+    stability_parts = []
+    if "employment_ge_10yr" in df.columns:
+        stability_parts.append(pd.to_numeric(df["employment_ge_10yr"], errors="coerce"))
+    if "credit_history_long" in df.columns:
+        stability_parts.append(pd.to_numeric(df["credit_history_long"], errors="coerce"))
+    if "home_ownership_is_rent" in df.columns:
+        stability_parts.append(1 - pd.to_numeric(df["home_ownership_is_rent"], errors="coerce"))
+    if stability_parts:
+        df["stability_index"] = pd.concat(stability_parts, axis=1).sum(axis=1).astype(np.float32)
+
+    if "mo_sin_rcnt_tl" in df.columns:
+        mo_recent = pd.to_numeric(df["mo_sin_rcnt_tl"], errors="coerce")
+        df["recent_trade_freshness"] = (1.0 / (1.0 + mo_recent.clip(lower=0))).astype(np.float32)
+
+    if "tot_hi_cred_lim" in df.columns and "loan_amnt" in df.columns:
+        lim = pd.to_numeric(df["tot_hi_cred_lim"], errors="coerce")
+        loan = pd.to_numeric(df["loan_amnt"], errors="coerce")
+        df["credit_limit_to_loan"] = (lim / (loan + 1.0)).astype(np.float32)
+
+    if "avg_cur_bal" in df.columns and "annual_inc" in df.columns:
+        bal = pd.to_numeric(df["avg_cur_bal"], errors="coerce")
+        inc = pd.to_numeric(df["annual_inc"], errors="coerce")
+        df["avg_balance_to_income"] = (bal / (inc + 1.0)).astype(np.float32)
+
+    if "credit_velocity_score" in df.columns and "dti" in df.columns:
+        vel = pd.to_numeric(df["credit_velocity_score"], errors="coerce")
+        dti = pd.to_numeric(df["dti"], errors="coerce")
+        df["velocity_x_dti"] = (vel * (dti / 100.0)).astype(np.float32)
+
+    if "acc_open_past_24mths" in df.columns:
+        s = pd.to_numeric(df["acc_open_past_24mths"], errors="coerce")
+        df["acc_open_past_24mths_high"] = (s.fillna(0) >= 7).astype(int)
+
+    if "num_tl_op_past_12m" in df.columns:
+        s = pd.to_numeric(df["num_tl_op_past_12m"], errors="coerce")
+        df["num_tl_op_past_12m_high"] = (s.fillna(0) >= 3).astype(int)
+
+    if "inq_last_12m" in df.columns:
+        s = pd.to_numeric(df["inq_last_12m"], errors="coerce")
+        df["inq_last_12m_high"] = (s.fillna(0) >= 3).astype(int)
+
+    if "open_rv_24m" in df.columns:
+        s = pd.to_numeric(df["open_rv_24m"], errors="coerce")
+        df["open_rv_24m_high"] = (s.fillna(0) >= 4).astype(int)
+
+    risk_flag_cols = [
+        "term_is_60",
+        "home_ownership_is_rent",
+        "purpose_is_house",
+        "purpose_is_small_business",
+        "high_risk_state",
+        "employment_lt_1yr",
+        "recent_trade_within_6m",
+        "dti_very_high",
+        "many_recent_inquiries",
+        "inq_last_12m_high",
+        "revol_util_very_high",
+        "bc_util_very_high",
+        "avg_cur_bal_low",
+        "tot_hi_cred_lim_low",
+        "has_recent_delinq",
+        "has_severe_delinq",
+        "has_recent_chargeoff",
+        "has_bankruptcy",
+        "has_tax_lien",
+        "currently_delinquent",
+    ]
+    present_flags = [c for c in risk_flag_cols if c in df.columns]
+    if present_flags:
+        flag_mat = df[present_flags].apply(pd.to_numeric, errors="coerce").fillna(0)
+        df["risk_score_heuristic"] = flag_mat.sum(axis=1).astype(np.float32)
+        df["risk_score_heuristic_norm"] = (df["risk_score_heuristic"] / float(len(present_flags))).astype(np.float32)
+
     return df
 
 
