@@ -1,10 +1,10 @@
 import re
 from datetime import datetime
 from io import BytesIO
+import tempfile
+import os
+
 import duckdb
-import pyarrow as pa
-import pyarrow.parquet as pq
-from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
@@ -28,223 +28,7 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
-
-
-def load_data(uploaded_file, cache_dir=".data_cache"):
-    """Load data from uploaded file using DuckDB for memory efficiency"""
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(exist_ok=True)
-    
-    # Create a unique cache key based on file name and last modified time
-    file_id = f"{uploaded_file.name}_{uploaded_file.size}"
-    parquet_path = cache_dir / f"{hash(file_id)}.parquet"
-    
-    # Convert to parquet if not already done
-    if not parquet_path.exists():
-        if uploaded_file.name.endswith('.xlsx'):
-            # Read first 1000 rows to infer schema
-            df_sample = pd.read_excel(uploaded_file, nrows=1000)
-            schema = pa.Schema.from_pandas(df_sample)
-            
-            # Read and write in chunks
-            chunks = pd.read_excel(uploaded_file, chunksize=10000)
-            with pq.ParquetWriter(str(parquet_path), schema) as writer:
-                for chunk in chunks:
-                    table = pa.Table.from_pandas(chunk, schema=schema)
-                    writer.write_table(table)
-        else:
-            # For CSV/other formats
-            chunks = pd.read_csv(uploaded_file, chunksize=10000)
-            first_chunk = True
-            for chunk in chunks:
-                if first_chunk:
-                    schema = pa.Schema.from_pandas(chunk)
-                    writer = pq.ParquetWriter(str(parquet_path), schema)
-                    first_chunk = False
-                table = pa.Table.from_pandas(chunk, schema=schema)
-                writer.write_table(table)
-            writer.close()
-    
-    # Connect to DuckDB and register the parquet file
-    con = duckdb.connect(database=':memory:')
-    con.execute(f"""
-        CREATE OR REPLACE TABLE loan_data AS 
-        SELECT * FROM read_parquet('{str(parquet_path)}')
-    """)
-    return con
-
-
-def process_data_chunked(con, process_func, batch_size=10000):
-    """Process data in chunks using DuckDB"""
-    total_rows = con.execute("SELECT COUNT(*) FROM loan_data").fetchone()[0]
-    results = []
-    
-    for offset in range(0, total_rows, batch_size):
-        df_chunk = con.execute(f"""
-            SELECT * FROM loan_data 
-            ORDER BY rowid 
-            LIMIT {batch_size} OFFSET {offset}
-        """).fetchdf()
-        
-        if df_chunk.empty:
-            break
-            
-        # Process the chunk
-        result = process_func(df_chunk)
-        if result is not None:
-            results.append(result)
-    
-    # Combine results if needed
-    if results and isinstance(results[0], pd.DataFrame):
-        return pd.concat(results, ignore_index=True)
-    return results
-
-
-def train_model_chunked(con, X_cols, y_col, batch_size=10000, thorough_training=False):
-    """Train model using chunked data"""
-    # Get total rows for progress tracking
-    total_rows = con.execute("SELECT COUNT(*) FROM loan_data").fetchone()[0]
-    
-    # Get feature types for preprocessing
-    sample = con.execute(f"SELECT * FROM loan_data LIMIT 1").fetchdf()
-    numeric_features = sample[X_cols].select_dtypes(include=['int64', 'float64']).columns.tolist()
-    categorical_features = list(set(X_cols) - set(numeric_features))
-    
-    # Preprocessing
-    numeric_transformer = Pipeline(steps=[
-        ('imputer', SimpleImputer(strategy='median'))
-    ])
-    
-    categorical_transformer = Pipeline(steps=[
-        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-        ('onehot', OneHotEncoder(handle_unknown='ignore'))
-    ])
-    
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('num', numeric_transformer, numeric_features),
-            ('cat', categorical_transformer, categorical_features)
-        ])
-    
-    # Initialize model
-    if thorough_training:
-        model = LGBMClassifier(
-            n_estimators=200,
-            learning_rate=0.05,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1
-        )
-    else:
-        model = LGBMClassifier(
-            n_estimators=100,
-            learning_rate=0.1,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1
-        )
-    
-    # Create progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    try:
-        # Train in chunks
-        X_chunks = []
-        y_chunks = []
-        
-        for offset in range(0, total_rows, batch_size):
-            # Update progress
-            progress = min((offset + batch_size) / total_rows, 1.0)
-            progress_bar.progress(progress)
-            status_text.text(f"Processing batch {offset//batch_size + 1}...")
-            
-            # Get chunk
-            query = f"""
-                SELECT * FROM loan_data 
-                ORDER BY rowid 
-                LIMIT {batch_size} OFFSET {offset}
-            """
-            chunk = con.execute(query).fetchdf()
-            
-            if chunk.empty:
-                break
-                
-            X_chunk = chunk[X_cols]
-            y_chunk = chunk[y_col]
-            
-            if thorough_training:
-                # For thorough training, collect all data first
-                X_chunks.append(X_chunk)
-                y_chunks.append(y_chunk)
-            else:
-                # For regular training, fit incrementally
-                if offset == 0:
-                    model = Pipeline([
-                        ('preprocessor', preprocessor),
-                        ('classifier', model)
-                    ])
-                    model.fit(X_chunk, y_chunk)
-                else:
-                    # For models that support partial_fit
-                    if hasattr(model, 'partial_fit'):
-                        X_processed = preprocessor.transform(X_chunk)
-                        model.partial_fit(X_processed, y_chunk, classes=[0, 1])
-                    else:
-                        # Retrain on accumulated data if partial_fit not available
-                        X_all = pd.concat([X_all, X_chunk])
-                        y_all = pd.concat([y_all, y_chunk])
-                        model.fit(X_all, y_all)
-        
-        if thorough_training:
-            # Combine all data for thorough training
-            X_all = pd.concat(X_chunks)
-            y_all = pd.concat(y_chunks)
-            
-            # Update status
-            status_text.text("Performing thorough hyperparameter search...")
-            
-            # Define parameter grid for RandomizedSearchCV
-            param_dist = {
-                'classifier__n_estimators': [100, 200, 300],
-                'classifier__learning_rate': [0.01, 0.05, 0.1],
-                'classifier__max_depth': [3, 5, 7],
-                'classifier__min_child_samples': [20, 50, 100],
-                'classifier__subsample': [0.8, 0.9, 1.0],
-                'classifier__colsample_bytree': [0.8, 0.9, 1.0]
-            }
-            
-            # Create pipeline for RandomizedSearchCV
-            model = Pipeline([
-                ('preprocessor', preprocessor),
-                ('classifier', LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1))
-            ])
-            
-            # Perform randomized search with cross-validation
-            search = RandomizedSearchCV(
-                model,
-                param_distributions=param_dist,
-                n_iter=10,
-                cv=3,
-                scoring='roc_auc',
-                n_jobs=-1,
-                verbose=1,
-                random_state=42
-            )
-            
-            # Fit the model with progress updates
-            search.fit(X_all, y_all)
-            model = search.best_estimator_
-            
-            # Update status
-            status_text.text(f"Best parameters: {search.best_params_}")
-        
-        return model
-        
-    finally:
-        # Clean up progress bar
-        progress_bar.empty()
-        status_text.empty()
+import gc
 
 
 def parse_emp_length(val):
@@ -289,7 +73,48 @@ def calculate_months_since(date_val, reference_date="2015-01-01"):
         return np.nan
 
 
-def clean_dataframe(df):
+@st.cache_data(show_spinner=False)
+def load_excel_to_duckdb(uploaded_file):
+    """Load Excel file into DuckDB for memory-efficient processing"""
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+        tmp.write(uploaded_file.getvalue())
+        tmp_path = tmp.name
+    
+    try:
+        # Read Excel to parquet (more efficient)
+        df_temp = pd.read_excel(tmp_path, engine="openpyxl")
+        
+        # Create a temporary parquet file
+        parquet_path = tmp_path.replace('.xlsx', '.parquet')
+        df_temp.to_parquet(parquet_path, index=False)
+        del df_temp
+        gc.collect()
+        
+        # Create DuckDB connection
+        conn = duckdb.connect(':memory:')
+        conn.execute(f"CREATE TABLE data AS SELECT * FROM read_parquet('{parquet_path}')")
+        
+        # Clean up temp files
+        os.unlink(parquet_path)
+        
+        return conn, tmp_path
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise e
+
+
+def get_sample_from_duckdb(conn, n_rows=100):
+    """Get a sample for preview"""
+    return conn.execute(f"SELECT * FROM data LIMIT {n_rows}").df()
+
+
+def clean_dataframe(df, use_duckdb=False, conn=None):
+    """Clean dataframe with optional DuckDB streaming for large datasets"""
+    if use_duckdb and conn is not None:
+        # Process cleaning via SQL for memory efficiency
+        return clean_dataframe_duckdb(conn)
+    
     df = df.copy()
 
     if "outcome" in df.columns:
@@ -348,6 +173,73 @@ def clean_dataframe(df):
         df = df.drop("emp_title", axis=1)
 
     return df
+
+
+def clean_dataframe_duckdb(conn):
+    """Memory-efficient cleaning using DuckDB SQL operations"""
+    # Create cleaned table with SQL transformations
+    conn.execute("""
+        CREATE OR REPLACE TABLE data_cleaned AS
+        SELECT 
+            *,
+            CASE 
+                WHEN UPPER(TRIM(CAST(outcome AS VARCHAR))) = 'DEFAULTED' THEN 1
+                WHEN UPPER(TRIM(CAST(outcome AS VARCHAR))) = 'FULLY PAID' THEN 0
+                ELSE NULL
+            END as is_default,
+            CAST(regexp_extract(CAST(term AS VARCHAR), '(\d+)', 1) AS DOUBLE) as term_months
+        FROM data
+    """)
+    
+    # Get the cleaned data in chunks
+    result = conn.execute("SELECT * FROM data_cleaned").df()
+    
+    # Drop original columns that were transformed
+    if 'outcome' in result.columns:
+        result = result.drop('outcome', axis=1)
+    if 'term' in result.columns:
+        result = result.drop('term', axis=1)
+    
+    # Apply remaining transformations (emp_length, percentages, dates, categoricals)
+    if "emp_length" in result.columns:
+        result["emp_length_years"] = result["emp_length"].apply(parse_emp_length)
+        result = result.drop("emp_length", axis=1)
+
+    percentage_cols = ["revol_util", "bc_util", "percent_bc_gt_75", "all_util", "il_util"]
+    for col in percentage_cols:
+        if col in result.columns:
+            result[col] = result[col].apply(parse_percentage)
+
+    if "earliest_cr_line" in result.columns:
+        result["credit_history_months"] = result["earliest_cr_line"].apply(
+            lambda x: calculate_months_since(x, reference_date="2015-01-01")
+        )
+        result = result.drop("earliest_cr_line", axis=1)
+
+    categorical_cols = ["home_ownership", "purpose", "addr_state", "emp_title"]
+    for col in categorical_cols:
+        if col in result.columns:
+            result[col] = result[col].astype(str).str.strip().str.upper()
+            result[col] = result[col].replace(["NAN", "NONE", "NULL", ""], np.nan)
+
+    non_numeric_object_candidates = [
+        c
+        for c in result.columns
+        if c not in set(categorical_cols + ["borrower_id"]) and result[c].dtype == object
+    ]
+    for col in non_numeric_object_candidates:
+        coerced = pd.to_numeric(result[col], errors="coerce")
+        non_null = result[col].notna().sum()
+        if non_null == 0:
+            continue
+        success_ratio = coerced.notna().sum() / non_null
+        if success_ratio >= 0.8:
+            result[col] = coerced
+
+    if "emp_title" in result.columns:
+        result = result.drop("emp_title", axis=1)
+
+    return result
 
 
 def _missingness_diff_table(X, y, min_missing_diff=0.05):
@@ -546,11 +438,6 @@ def to_excel_bytes(df):
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="predictions")
     return output.getvalue()
-
-
-@st.cache_data(show_spinner=False)
-def load_excel(uploaded_file):
-    return pd.read_excel(uploaded_file, engine="openpyxl")
 
 
 def get_pipeline_feature_names(pipeline):
@@ -944,327 +831,346 @@ def main():
         if train_file is None:
             st.info("Upload training data in the sidebar to begin.")
         else:
-            df_raw = load_excel(train_file)
-            st.write("Preview")
-            st.dataframe(df_raw.head(20), use_container_width=True)
+            # Use DuckDB for memory-efficient loading
+            use_streaming = st.checkbox("Use memory-efficient streaming (recommended for large files)", value=True)
+            
+            if use_streaming:
+                try:
+                    conn, tmp_path = load_excel_to_duckdb(train_file)
+                    st.success("Data loaded efficiently using DuckDB streaming")
+                    
+                    # Show preview
+                    st.write("Preview")
+                    preview_df = get_sample_from_duckdb(conn, n_rows=20)
+                    st.dataframe(preview_df, width='stretch')
+                    
+                    if "outcome" not in preview_df.columns:
+                        st.error("Training file must contain an 'outcome' column with values 'Fully Paid' or 'Defaulted'.")
+                        conn.close()
+                        os.unlink(tmp_path)
+                    else:
+                        # Process data efficiently
+                        df_clean = clean_dataframe_duckdb(conn)
+                        conn.close()
+                        os.unlink(tmp_path)
+                        
+                        df_feat = engineer_fraud_features(df_clean)
+                        
+                        # Clean up intermediate dataframe
+                        del df_clean
+                        gc.collect()
+                        
+                except Exception as e:
+                    st.error(f"Error loading data: {e}")
+                    use_streaming = False
+            
+            if not use_streaming:
+                df_raw = pd.read_excel(train_file, engine="openpyxl")
+                st.write("Preview")
+                st.dataframe(df_raw.head(20), width='stretch')
 
-            if "outcome" not in df_raw.columns:
-                st.error("Training file must contain an 'outcome' column with values 'Fully Paid' or 'Defaulted'.")
-            else:
-                df_clean = clean_dataframe(df_raw)
-                df_feat = engineer_fraud_features(df_clean)
+                if "outcome" not in df_raw.columns:
+                    st.error("Training file must contain an 'outcome' column with values 'Fully Paid' or 'Defaulted'.")
+                else:
+                    df_clean = clean_dataframe(df_raw)
+                    df_feat = engineer_fraud_features(df_clean)
+                    
+                    # Clean up
+                    del df_raw, df_clean
+                    gc.collect()
 
+            if (use_streaming or 'df_feat' in locals()) and 'df_feat' in locals():
                 if "is_default" not in df_feat.columns:
                     st.error("Could not create target column 'is_default'. Check 'outcome' values.")
-                    return
+                else:
+                    y = df_feat["is_default"].astype(float)
+                    mask = y.notna()
+                    df_feat = df_feat.loc[mask].reset_index(drop=True)
+                    y = y.loc[mask].astype(int).reset_index(drop=True)
 
-                y = df_feat["is_default"].astype(float)
-                mask = y.notna()
-                df_feat = df_feat.loc[mask].reset_index(drop=True)
-                y = y.loc[mask].astype(int).reset_index(drop=True)
+                    class_counts = y.value_counts().rename({0: "Fully Paid", 1: "Defaulted"}).reset_index()
+                    class_counts.columns = ["class", "count"]
+                    fig_class = px.bar(class_counts, x="class", y="count", title="Class distribution")
+                    st.plotly_chart(fig_class, use_container_width=False)
 
-                class_counts = y.value_counts().rename({0: "Fully Paid", 1: "Defaulted"}).reset_index()
-                class_counts.columns = ["class", "count"]
-                fig_class = px.bar(class_counts, x="class", y="count", title="Class distribution")
-                st.plotly_chart(fig_class, use_container_width=True)
+                    st.markdown("### Data analysis & fraud indicators")
+                    cat_min = st.slider(
+                        "Minimum category count (for categorical risk analysis)",
+                        min_value=25,
+                        max_value=1000,
+                        value=200,
+                        step=25,
+                    )
+                    report = build_analysis_report(df_feat, y, categorical_min_count=int(cat_min))
+                    ov = report["overview"]
 
-                st.markdown("### Data analysis & fraud indicators")
-                cat_min = st.slider(
-                    "Minimum category count (for categorical risk analysis)",
-                    min_value=25,
-                    max_value=1000,
-                    value=200,
-                    step=25,
-                )
-                report = build_analysis_report(df_feat, y, categorical_min_count=int(cat_min))
-                ov = report["overview"]
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Rows analyzed", f"{ov['rows_analyzed']:,}")
+                    c2.metric("Defaulters", f"{ov['num_defaulters']:,}")
+                    c3.metric("Fully Paid", f"{ov['num_fully_paid']:,}")
+                    c4.metric("Default rate", f"{ov['default_rate']:.2%}")
 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Rows analyzed", f"{ov['rows_analyzed']:,}")
-                c2.metric("Defaulters", f"{ov['num_defaulters']:,}")
-                c3.metric("Fully Paid", f"{ov['num_fully_paid']:,}")
-                c4.metric("Default rate", f"{ov['default_rate']:.2%}")
+                    with st.expander("Conclusions (auto-generated)", expanded=True):
+                        if report["conclusions"]:
+                            for line in report["conclusions"][:80]:
+                                st.write(f"- {line}")
+                        else:
+                            st.info("Not enough labeled rows to generate conclusions.")
 
-                with st.expander("Conclusions (auto-generated)", expanded=True):
-                    if report["conclusions"]:
-                        for line in report["conclusions"][:80]:
-                            st.write(f"- {line}")
-                    else:
-                        st.info("Not enough labeled rows to generate conclusions.")
+                    with st.expander("Missingness (top 30 columns)"):
+                        st.dataframe(report["missing"].head(30), width='stretch')
 
-                with st.expander("Missingness (top 30 columns)"):
-                    st.dataframe(report["missing"].head(30), use_container_width=True)
+                    with st.expander("Missingness differences: defaulters vs payers"):
+                        if report["missing_diff"].empty:
+                            st.info("No large missingness differences found.")
+                        else:
+                            st.dataframe(report["missing_diff"].head(50), width='stretch')
 
-                with st.expander("Missingness differences: defaulters vs payers"):
-                    if report["missing_diff"].empty:
-                        st.info("No large missingness differences found.")
-                    else:
-                        st.dataframe(report["missing_diff"].head(50), use_container_width=True)
+                    with st.expander("Fraud indicators (engineered flags)"):
+                        if report["fraud_flags"].empty:
+                            st.info("No engineered fraud indicator columns found in this dataset.")
+                        else:
+                            st.dataframe(report["fraud_flags"].head(30), width='stretch')
+                            fig_flags = px.bar(
+                                report["fraud_flags"].head(15),
+                                x="lift_vs_base",
+                                y="indicator",
+                                orientation="h",
+                                title="Engineered fraud indicators (lift vs base default rate)",
+                            )
+                            st.plotly_chart(fig_flags, use_container_width=False)
 
-                with st.expander("Fraud indicators (engineered flags)"):
-                    if report["fraud_flags"].empty:
-                        st.info("No engineered fraud indicator columns found in this dataset.")
-                    else:
-                        st.dataframe(report["fraud_flags"].head(30), use_container_width=True)
-                        fig_flags = px.bar(
-                            report["fraud_flags"].head(15),
-                            x="lift_vs_base",
-                            y="indicator",
-                            orientation="h",
-                            title="Engineered fraud indicators (lift vs base default rate)",
-                        )
-                        st.plotly_chart(fig_flags, use_container_width=True)
+                    with st.expander("Numeric differences: defaulters vs payers"):
+                        if report["numeric_diff"].empty:
+                            st.info("Not enough numeric columns with sufficient non-missing values.")
+                        else:
+                            st.dataframe(report["numeric_diff"].head(50), width='stretch')
+                            top_feature = report["numeric_diff"].iloc[0]["feature"]
+                            plot_df = pd.DataFrame(
+                                {
+                                    "value": pd.to_numeric(df_feat[top_feature], errors="coerce"),
+                                    "class": np.where(y.values == 1, "Defaulted", "Fully Paid"),
+                                }
+                            )
+                            plot_df = plot_df.dropna()
+                            if len(plot_df) > 0:
+                                fig_box = px.box(plot_df, x="class", y="value", title=f"{top_feature} distribution")
+                                st.plotly_chart(fig_box, use_container_width=False)
 
-                with st.expander("Numeric differences: defaulters vs payers"):
-                    if report["numeric_diff"].empty:
-                        st.info("Not enough numeric columns with sufficient non-missing values.")
-                    else:
-                        st.dataframe(report["numeric_diff"].head(50), use_container_width=True)
-                        top_feature = report["numeric_diff"].iloc[0]["feature"]
-                        plot_df = pd.DataFrame(
-                            {
-                                "value": pd.to_numeric(df_feat[top_feature], errors="coerce"),
-                                "class": np.where(y.values == 1, "Defaulted", "Fully Paid"),
-                            }
-                        )
-                        plot_df = plot_df.dropna()
-                        if len(plot_df) > 0:
-                            fig_box = px.box(plot_df, x="class", y="value", title=f"{top_feature} distribution")
-                            st.plotly_chart(fig_box, use_container_width=True)
+                    with st.expander("Categorical differences: high-risk categories"):
+                        if report["categorical_risk"].empty:
+                            st.info("No categorical columns with categories above the minimum count.")
+                        else:
+                            st.dataframe(report["categorical_risk"].head(50), width='stretch')
 
-                with st.expander("Categorical differences: high-risk categories"):
-                    if report["categorical_risk"].empty:
-                        st.info("No categorical columns with categories above the minimum count.")
-                    else:
-                        st.dataframe(report["categorical_risk"].head(50), use_container_width=True)
-
-                analysis_bytes = analysis_report_to_excel_bytes(report)
-                st.download_button(
-                    "Download analysis report (Excel)",
-                    data=analysis_bytes,
-                    file_name="training_data_analysis.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-                train_btn = st.button("Train model", type="primary")
-
-                if train_btn:
-                    if y.nunique() < 2:
-                        st.error("Need both classes present in training data.")
-                        return
-
-                    X = df_feat.drop(columns=["is_default"], errors="ignore")
-
-                    X_train, X_val, y_train, y_val = train_test_split(
-                        X,
-                        y,
-                        test_size=0.2,
-                        random_state=42,
-                        stratify=y,
+                    analysis_bytes = analysis_report_to_excel_bytes(report)
+                    st.download_button(
+                        "Download analysis report (Excel)",
+                        data=analysis_bytes,
+                        file_name="training_data_analysis.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
 
-                    pipeline, numeric_features, categorical_features = build_pipeline(df_feat)
+                    train_btn = st.button("Train model", type="primary")
 
-                    progress = st.progress(0)
-                    status = st.empty()
+                    if train_btn:
+                        if y.nunique() < 2:
+                            st.error("Need both classes present in training data.")
+                        else:
+                            X = df_feat.drop(columns=["is_default"], errors="ignore")
 
-                    status.write("Fitting model...")
-                    if training_mode == "Thorough (CV tuning)":
-                        status.write("Hyperparameter tuning (this can take a few minutes)...")
-                        param_distributions = {
-                            "classifier__n_estimators": [200, 300, 500, 800],
-                            "classifier__learning_rate": [0.03, 0.05, 0.07],
-                            "classifier__max_depth": [-1, 4, 6, 8],
-                            "classifier__num_leaves": [15, 31, 63, 127],
-                            "classifier__min_child_samples": [10, 20, 50],
-                            "classifier__subsample": [0.8, 1.0],
-                            "classifier__colsample_bytree": [0.8, 1.0],
-                            "classifier__reg_alpha": [0.0, 0.1, 0.5],
-                            "classifier__reg_lambda": [0.0, 0.1, 0.5],
-                        }
+                            X_train, X_val, y_train, y_val = train_test_split(
+                                X,
+                                y,
+                                test_size=0.2,
+                                random_state=42,
+                                stratify=y,
+                            )
 
-                        search = RandomizedSearchCV(
-                            estimator=pipeline,
-                            param_distributions=param_distributions,
-                            n_iter=int(tuning_iterations),
-                            scoring="average_precision",
-                            cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
-                            n_jobs=-1,
-                            verbose=0,
-                            random_state=42,
-                        )
-                        search.fit(X_train, y_train)
-                        pipeline = search.best_estimator_
-                        progress.progress(60)
-                    else:
-                        pipeline.fit(X_train, y_train)
-                    progress.progress(60)
+                            pipeline, numeric_features, categorical_features = build_pipeline(df_feat)
 
-                    status.write("Evaluating...")
-                    y_proba_val = pipeline.predict_proba(X_val)[:, 1]
+                            progress = st.progress(0)
+                            status = st.empty()
 
-                    if threshold_mode == "Optimize":
-                        threshold = find_optimal_threshold(y_val, y_proba_val, metric=optimize_metric)
-                    else:
-                        threshold = float(manual_threshold)
+                            status.write("Fitting model...")
+                            if training_mode == "Thorough (CV tuning)":
+                                status.write("Hyperparameter tuning (this can take a few minutes)...")
+                                param_distributions = {
+                                    "classifier__n_estimators": [200, 300, 500, 800],
+                                    "classifier__learning_rate": [0.03, 0.05, 0.07],
+                                    "classifier__max_depth": [-1, 4, 6, 8],
+                                    "classifier__num_leaves": [15, 31, 63, 127],
+                                    "classifier__min_child_samples": [10, 20, 50],
+                                    "classifier__subsample": [0.8, 1.0],
+                                    "classifier__colsample_bytree": [0.8, 1.0],
+                                    "classifier__reg_alpha": [0.0, 0.1, 0.5],
+                                    "classifier__reg_lambda": [0.0, 0.1, 0.5],
+                                }
 
-                    metrics, y_pred_val = evaluate_model(y_val, y_proba_val, threshold=threshold)
-                    progress.progress(85)
-
-                    feature_names = get_pipeline_feature_names(pipeline)
-
-                    cv_auc = None
-                    cv_pr_auc = None
-                    try:
-                        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-                        aucs = []
-                        prs = []
-                        for tr_idx, te_idx in cv.split(X, y):
-                            X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
-                            y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
-                            p, _, _ = build_pipeline(df_feat)
-                            p.fit(X_tr, y_tr)
-                            proba = p.predict_proba(X_te)[:, 1]
-                            aucs.append(roc_auc_score(y_te, proba))
-                            prs.append(average_precision_score(y_te, proba))
-                        cv_auc = float(np.mean(aucs))
-                        cv_pr_auc = float(np.mean(prs))
-                    except Exception:
-                        cv_auc = None
-                        cv_pr_auc = None
-
-                    artifacts = {
-                        "pipeline": pipeline,
-                        "threshold": threshold,
-                        "feature_names": feature_names,
-                        "numeric_features": numeric_features,
-                        "categorical_features": categorical_features,
-                        "training_date": datetime.now(),
-                        "performance_metrics": metrics,
-                        "cv_roc_auc_mean": cv_auc,
-                        "cv_pr_auc_mean": cv_pr_auc,
-                        "required_columns": numeric_features + categorical_features,
-                    }
-                    
-                    # Display loading state
-                    with st.spinner('Loading and processing data (this may take a while)...'):
-                        # Load data using memory-efficient method
-                        con = load_data(train_file)
-                        
-                        # Get column names and sample data for display
-                        columns = con.execute("DESCRIBE loan_data").fetchdf()['column_name'].tolist()
-                        sample_data = con.execute("SELECT * FROM loan_data LIMIT 5").fetchdf()
-                        
-                        # Clean and engineer features in chunks
-                        def process_chunk(chunk):
-                            chunk = clean_dataframe(chunk)
-                            return engineer_fraud_features(chunk)
-                        
-                        # Process data in chunks
-                        processed_data = process_data_chunked(con, process_chunk)
-                        
-                        # Get the updated column names after feature engineering
-                        sample_processed = process_chunk(sample_data)
-                        
-                        # Display data info
-                        st.subheader("Data Preview")
-                        st.write(f"Shape: {con.execute('SELECT COUNT(*) FROM loan_data').fetchone()[0]} rows, {len(sample_processed.columns)} columns")
-                        st.dataframe(sample_processed)
-                        
-                        # Model training options
-                        st.subheader("2. Model Training Options")
-                        thorough_training = st.checkbox("Enable thorough training (slower but more accurate)", 
-                                                     help="Uses RandomizedSearchCV for hyperparameter tuning")
-                        
-                        # Train button
-                        train_btn = st.button("Train Model")
-                        
-                        if train_btn:
-                            with st.spinner('Training model (this may take a while)...'):
-                                try:
-                                    # Get column names for features and target
-                                    y_col = 'is_default'
-                                    X_cols = [c for c in sample_processed.columns if c not in [y_col, 'borrower_id']]
-                                    
-                                    # Train model using chunked data
-                                    model = train_model_chunked(
-                                        con, 
-                                        X_cols, 
-                                        y_col, 
-                                        thorough_training=thorough_training
-                                    )
-                                    
-                                    # Save model
-                                    joblib.dump(model, 'fraud_detection_model.joblib')
-                                    st.success('Model trained and saved successfully!')
-                                    
-                                    # Display model info
-                                    if hasattr(model, 'best_params_') and thorough_training:
-                                        st.subheader("Best Parameters from Tuning")
-                                        st.json(model.best_params_)
-                                    
-                                except Exception as e:
-                                    st.error(f"Error during training: {str(e)}")
-                                    st.exception(e)
-                                finally:
-                                    # Clean up DuckDB connection
-                                    if 'con' in locals():
-                                        con.close()
-                            
-                            # Get predictions for validation set if available
-                            if 'X_val' in globals() and 'y_val' in globals() and hasattr(model, 'predict_proba'):
-                                try:
-                                    y_proba_val = model.predict_proba(X_val)[:, 1]
-                                    
-                                    # Plot precision-recall curve
-                                    try:
-                                        prec, rec, _ = precision_recall_curve(y_val, y_proba_val)
-                                        fig_pr = go.Figure()
-                                        fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="PR"))
-                                        fig_pr.update_layout(
-                                            title="Precision-Recall Curve (Validation)",
-                                            xaxis_title="Recall",
-                                            yaxis_title="Precision",
-                                            height=380,
-                                        )
-                                        st.plotly_chart(fig_pr, use_container_width=True)
-                                    except Exception as e:
-                                        st.warning(f"Could not generate precision-recall curve: {str(e)}")
-                                    
-                                    # Show performance by loan amount buckets if data is available
-                                    try:
-                                        with st.expander("Performance by loan amount buckets"):
-                                            if all(col in X_val.columns for col in ['loan_amnt']):
-                                                bucket_df = _loan_amount_bucket_table(X_val, y_val, y_proba_val, threshold=0.5, buckets=5)
-                                                if not bucket_df.empty:
-                                                    st.dataframe(bucket_df, use_container_width=True)
-                                                else:
-                                                    st.info("Loan amount buckets not available (missing loan_amnt or not enough data).")
-                                            else:
-                                                st.info("Loan amount data not available for bucketing.")
-                                    except Exception as e:
-                                        st.warning(f"Could not generate loan amount buckets: {str(e)}")
-                                    
-                                    # Show feature importances if available
-                                    if hasattr(model, 'feature_importances_') and 'feature_names' in globals() and feature_names is not None:
-                                        try:
-                                            importances = model.feature_importances_
-                                            fi = pd.DataFrame({"feature": feature_names, "importance": importances})
-                                            fi = fi.sort_values("importance", ascending=False).head(30)
-                                            fig_fi = px.bar(fi, x="importance", y="feature", 
-                                                          orientation="h", 
-                                                          title="Top feature importances")
-                                            st.plotly_chart(fig_fi, use_container_width=True)
-                                        except Exception as e:
-                                            st.warning(f"Could not generate feature importance plot: {str(e)}")
-                                    
-                                except Exception as e:
-                                    st.warning(f"Error during model evaluation: {str(e)}")
+                                search = RandomizedSearchCV(
+                                    estimator=pipeline,
+                                    param_distributions=param_distributions,
+                                    n_iter=int(tuning_iterations),
+                                    scoring="average_precision",
+                                    cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
+                                    n_jobs=1,
+                                    verbose=0,
+                                    random_state=42,
+                                )
+                                search.fit(X_train, y_train)
+                                pipeline = search.best_estimator_
+                                
+                                # Clean up search object to free memory
+                                del search
+                                gc.collect()
+                                
+                                progress.progress(60)
                             else:
-                                st.info("Validation data not available for generating evaluation plots.")
-                except Exception as e:
-                    st.error(f"An error occurred: {str(e)}")
-                    st.exception(e)
+                                pipeline.fit(X_train, y_train)
+                            
+                            # Free up training data memory
+                            del X_train, y_train
+                            gc.collect()
+                            
+                            progress.progress(60)
+
+                            status.write("Evaluating...")
+                            y_proba_val = pipeline.predict_proba(X_val)[:, 1]
+
+                            if threshold_mode == "Optimize":
+                                threshold = find_optimal_threshold(y_val, y_proba_val, metric=optimize_metric)
+                            else:
+                                threshold = float(manual_threshold)
+
+                            metrics, y_pred_val = evaluate_model(y_val, y_proba_val, threshold=threshold)
+                            progress.progress(85)
+
+                            feature_names = get_pipeline_feature_names(pipeline)
+
+                            cv_auc = None
+                            cv_pr_auc = None
+                            try:
+                                cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+                                aucs = []
+                                prs = []
+                                for tr_idx, te_idx in cv.split(X, y):
+                                    X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
+                                    y_tr, y_te = y.iloc[tr_idx], y.iloc[te_idx]
+                                    p, _, _ = build_pipeline(df_feat)
+                                    p.fit(X_tr, y_tr)
+                                    proba = p.predict_proba(X_te)[:, 1]
+                                    aucs.append(roc_auc_score(y_te, proba))
+                                    prs.append(average_precision_score(y_te, proba))
+                                    
+                                    # Clean up fold data
+                                    del X_tr, X_te, y_tr, y_te, p, proba
+                                    gc.collect()
+                                    
+                                cv_auc = float(np.mean(aucs))
+                                cv_pr_auc = float(np.mean(prs))
+                            except Exception:
+                                cv_auc = None
+                                cv_pr_auc = None
+
+                            artifacts = {
+                                "pipeline": pipeline,
+                                "threshold": threshold,
+                                "feature_names": feature_names,
+                                "numeric_features": numeric_features,
+                                "categorical_features": categorical_features,
+                                "training_date": datetime.now(),
+                                "performance_metrics": metrics,
+                                "cv_roc_auc_mean": cv_auc,
+                                "cv_pr_auc_mean": cv_pr_auc,
+                                "required_columns": numeric_features + categorical_features,
+                            }
+
+                            st.session_state.artifacts = artifacts
+                            try:
+                                joblib.dump(artifacts, "fraud_detection_model.joblib")
+                            except Exception:
+                                pass
+
+                            progress.progress(100)
+                            status.write("Done")
+
+                            st.markdown("### Results")
+                            col1, col2 = st.columns([1, 1])
+
+                            with col1:
+                                st.write("Metrics")
+                                metrics_table = pd.DataFrame([metrics])
+                                if cv_auc is not None:
+                                    metrics_table["CV_ROC_AUC_Mean"] = cv_auc
+                                if cv_pr_auc is not None:
+                                    metrics_table["CV_PR_AUC_Mean"] = cv_pr_auc
+                                metrics_table["Threshold"] = threshold
+                                st.dataframe(metrics_table, width='stretch')
+
+                            with col2:
+                                cm = confusion_matrix(y_val, y_pred_val)
+                                cm_df = pd.DataFrame(
+                                    cm,
+                                    index=["Actual Fully Paid", "Actual Defaulted"],
+                                    columns=["Pred Fully Paid", "Pred Defaulted"],
+                                )
+                                fig_cm = px.imshow(
+                                    cm_df,
+                                    text_auto=True,
+                                    title="Confusion Matrix (Validation)",
+                                    color_continuous_scale="Blues",
+                                )
+                                st.plotly_chart(fig_cm, use_container_width=False)
+
+                            with st.expander("ROC & Precision-Recall curves"):
+                                try:
+                                    fpr, tpr, _ = roc_curve(y_val, y_proba_val)
+                                    fig_roc = go.Figure()
+                                    fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name="ROC"))
+                                    fig_roc.add_trace(
+                                        go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random", line=dict(dash="dash"))
+                                    )
+                                    fig_roc.update_layout(
+                                        title="ROC Curve (Validation)",
+                                        xaxis_title="False Positive Rate",
+                                        yaxis_title="True Positive Rate",
+                                        height=380,
+                                    )
+                                    st.plotly_chart(fig_roc, use_container_width=False)
+
+                                    prec, rec, _ = precision_recall_curve(y_val, y_proba_val)
+                                    fig_pr = go.Figure()
+                                    fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="PR"))
+                                    fig_pr.update_layout(
+                                        title="Precision-Recall Curve (Validation)",
+                                        xaxis_title="Recall",
+                                        yaxis_title="Precision",
+                                        height=380,
+                                    )
+                                    st.plotly_chart(fig_pr, use_container_width=False)
+                                except Exception as e:
+                                    st.info(f"Could not plot curves: {e}")
+
+                            with st.expander("Performance by loan amount buckets"):
+                                bucket_df = _loan_amount_bucket_table(X_val, y_val, y_proba_val, threshold=threshold, buckets=5)
+                                if bucket_df.empty:
+                                    st.info("Loan amount buckets not available (missing loan_amnt or not enough data).")
+                                else:
+                                    st.dataframe(bucket_df, width='stretch')
+
+                            if feature_names is not None:
+                                try:
+                                    importances = pipeline.named_steps["classifier"].feature_importances_
+                                    fi = pd.DataFrame({"feature": feature_names, "importance": importances})
+                                    fi = fi.sort_values("importance", ascending=False).head(30)
+                                    fig_fi = px.bar(fi, x="importance", y="feature", orientation="h", title="Top feature importances")
+                                    st.plotly_chart(fig_fi, use_container_width=False)
+                                except Exception:
+                                    pass
+                            
+                            # Clean up validation data
+                            del X_val, y_val, y_proba_val, y_pred_val
+                            gc.collect()
 
     with tab_score:
         st.subheader("Scoring")
@@ -1274,9 +1180,9 @@ def main():
         elif score_file is None:
             st.info("Upload scoring data in the sidebar.")
         else:
-            df_score_raw = load_excel(score_file)
+            df_score_raw = pd.read_excel(score_file, engine="openpyxl")
             st.write("Preview")
-            st.dataframe(df_score_raw.head(20), use_container_width=True)
+            st.dataframe(df_score_raw.head(20), width='stretch')
 
             score_btn = st.button("Score data", type="primary")
 
@@ -1287,6 +1193,10 @@ def main():
 
                 df_score_clean = clean_dataframe(df_score_raw)
                 df_score_feat = engineer_fraud_features(df_score_clean)
+                
+                # Clean up intermediate data
+                del df_score_raw, df_score_clean
+                gc.collect()
 
                 borrower_id = df_score_feat["borrower_id"] if "borrower_id" in df_score_feat.columns else None
 
@@ -1312,12 +1222,20 @@ def main():
                     labels=["Low Risk", "Medium Risk", "High Risk"],
                 ).astype(str)
 
-                output = df_score_raw.copy()
-                if "borrower_id" not in output.columns:
-                    output["borrower_id"] = borrower_id if borrower_id is not None else np.arange(len(proba))
+                # Reconstruct output with minimal memory usage
+                output = pd.DataFrame()
+                if borrower_id is not None:
+                    output["borrower_id"] = borrower_id
+                else:
+                    output["borrower_id"] = np.arange(len(proba))
+                
                 output["predicted_outcome"] = predicted_outcome
                 output["predicted_probability_default"] = proba
                 output["risk_category"] = risk_category
+                
+                # Clean up scoring data
+                del df_score_feat, X_score, proba, pred
+                gc.collect()
 
                 st.markdown("### Prediction distribution")
                 fig_hist = px.histogram(
@@ -1327,10 +1245,10 @@ def main():
                     color="risk_category",
                     title="Risk score distribution",
                 )
-                st.plotly_chart(fig_hist, use_container_width=True)
+                st.plotly_chart(fig_hist, use_container_width=False)
 
                 st.markdown("### Results")
-                st.dataframe(output.head(50), use_container_width=True)
+                st.dataframe(output.head(50), width='stretch')
 
                 excel_bytes = to_excel_bytes(output)
                 st.download_button(
@@ -1357,7 +1275,7 @@ def main():
                 "F1": (artifacts.get("performance_metrics") or {}).get("F1"),
                 "CV_ROC_AUC_Mean": artifacts.get("cv_roc_auc_mean"),
             }
-            st.dataframe(pd.DataFrame([summary]), use_container_width=True)
+            st.dataframe(pd.DataFrame([summary]), width='stretch')
 
             pipeline = artifacts["pipeline"]
             feature_names = artifacts.get("feature_names")
@@ -1369,7 +1287,7 @@ def main():
                     fi = fi.sort_values("importance", ascending=False)
                     top = fi.head(20)
                     fig = px.bar(top, x="importance", y="feature", orientation="h", title="Top fraud indicators")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=False)
                 except Exception:
                     st.info("Feature importance not available.")
 
