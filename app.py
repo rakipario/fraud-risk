@@ -1210,36 +1210,61 @@ def main():
                                     # Clean up DuckDB connection
                                     if 'con' in locals():
                                         con.close()
-                                            
-                            prec, rec, _ = precision_recall_curve(y_val, y_proba_val)
-                            fig_pr = go.Figure()
-                            fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="PR"))
-                            fig_pr.update_layout(
-                                title="Precision-Recall Curve (Validation)",
-                                xaxis_title="Recall",
-                                yaxis_title="Precision",
-                                height=380,
-                            )
-                            st.plotly_chart(fig_pr, use_container_width=True)
-                        except Exception as e:
-                            st.info(f"Could not plot curves: {e}")
-
-                    with st.expander("Performance by loan amount buckets"):
-                        bucket_df = _loan_amount_bucket_table(X_val, y_val, y_proba_val, threshold=threshold, buckets=5)
-                        if bucket_df.empty:
-                            st.info("Loan amount buckets not available (missing loan_amnt or not enough data).")
-                        else:
-                            st.dataframe(bucket_df, use_container_width=True)
-
-                    if feature_names is not None:
-                        try:
-                            importances = pipeline.named_steps["classifier"].feature_importances_
-                            fi = pd.DataFrame({"feature": feature_names, "importance": importances})
-                            fi = fi.sort_values("importance", ascending=False).head(30)
-                            fig_fi = px.bar(fi, x="importance", y="feature", orientation="h", title="Top feature importances")
-                            st.plotly_chart(fig_fi, use_container_width=True)
-                        except Exception:
-                            pass
+                            
+                            # Get predictions for validation set if available
+                            if 'X_val' in globals() and 'y_val' in globals() and hasattr(model, 'predict_proba'):
+                                try:
+                                    y_proba_val = model.predict_proba(X_val)[:, 1]
+                                    
+                                    # Plot precision-recall curve
+                                    try:
+                                        prec, rec, _ = precision_recall_curve(y_val, y_proba_val)
+                                        fig_pr = go.Figure()
+                                        fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", name="PR"))
+                                        fig_pr.update_layout(
+                                            title="Precision-Recall Curve (Validation)",
+                                            xaxis_title="Recall",
+                                            yaxis_title="Precision",
+                                            height=380,
+                                        )
+                                        st.plotly_chart(fig_pr, use_container_width=True)
+                                    except Exception as e:
+                                        st.warning(f"Could not generate precision-recall curve: {str(e)}")
+                                    
+                                    # Show performance by loan amount buckets if data is available
+                                    try:
+                                        with st.expander("Performance by loan amount buckets"):
+                                            if all(col in X_val.columns for col in ['loan_amnt']):
+                                                bucket_df = _loan_amount_bucket_table(X_val, y_val, y_proba_val, threshold=0.5, buckets=5)
+                                                if not bucket_df.empty:
+                                                    st.dataframe(bucket_df, use_container_width=True)
+                                                else:
+                                                    st.info("Loan amount buckets not available (missing loan_amnt or not enough data).")
+                                            else:
+                                                st.info("Loan amount data not available for bucketing.")
+                                    except Exception as e:
+                                        st.warning(f"Could not generate loan amount buckets: {str(e)}")
+                                    
+                                    # Show feature importances if available
+                                    if hasattr(model, 'feature_importances_') and 'feature_names' in globals() and feature_names is not None:
+                                        try:
+                                            importances = model.feature_importances_
+                                            fi = pd.DataFrame({"feature": feature_names, "importance": importances})
+                                            fi = fi.sort_values("importance", ascending=False).head(30)
+                                            fig_fi = px.bar(fi, x="importance", y="feature", 
+                                                          orientation="h", 
+                                                          title="Top feature importances")
+                                            st.plotly_chart(fig_fi, use_container_width=True)
+                                        except Exception as e:
+                                            st.warning(f"Could not generate feature importance plot: {str(e)}")
+                                    
+                                except Exception as e:
+                                    st.warning(f"Error during model evaluation: {str(e)}")
+                            else:
+                                st.info("Validation data not available for generating evaluation plots.")
+                except Exception as e:
+                    st.error(f"An error occurred: {str(e)}")
+                    st.exception(e)
 
     with tab_score:
         st.subheader("Scoring")
