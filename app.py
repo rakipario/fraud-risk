@@ -1145,71 +1145,71 @@ def main():
                         "cv_pr_auc_mean": cv_pr_auc,
                         "required_columns": numeric_features + categorical_features,
                     }
-                        try:
-                            # Display loading state
-                            with st.spinner('Loading and processing data (this may take a while)...'):
-                                # Load data using memory-efficient method
-                                con = load_data(train_file)
-                                
-                                # Get column names and sample data for display
-                                columns = con.execute("DESCRIBE loan_data").fetchdf()['column_name'].tolist()
-                                sample_data = con.execute("SELECT * FROM loan_data LIMIT 5").fetchdf()
-                                
-                                # Clean and engineer features in chunks
-                                def process_chunk(chunk):
-                                    chunk = clean_dataframe(chunk)
-                                    return engineer_fraud_features(chunk)
-                                
-                                # Process data in chunks
-                                processed_data = process_data_chunked(con, process_chunk)
-                                
-                                # Get the updated column names after feature engineering
-                                sample_processed = process_chunk(sample_data)
-                                
-                            # Display data info
-                            st.subheader("Data Preview")
-                            st.write(f"Shape: {con.execute('SELECT COUNT(*) FROM loan_data').fetchone()[0]} rows, {len(sample_processed.columns)} columns")
-                            st.dataframe(sample_processed)
-                            
-                            # Model training options
-                            st.subheader("2. Model Training Options")
-                            thorough_training = st.checkbox("Enable thorough training (slower but more accurate)", 
-                                                         help="Uses RandomizedSearchCV for hyperparameter tuning")
-                            
-                            # Train button
-                            train_btn = st.button("Train Model")
-                            
-                            if train_btn:
-                                with st.spinner('Training model (this may take a while)...'):
-                                    try:
-                                        # Get column names for features and target
-                                        y_col = 'is_default'
-                                        X_cols = [c for c in sample_processed.columns if c not in [y_col, 'borrower_id']]
-                                        
-                                        # Train model using chunked data
-                                        model = train_model_chunked(
-                                            con, 
-                                            X_cols, 
-                                            y_col, 
-                                            thorough_training=thorough_training
-                                        )
-                                        
-                                        # Save model
-                                        joblib.dump(model, 'fraud_detection_model.joblib')
-                                        st.success('Model trained and saved successfully!')
-                                        
-                                        # Display model info
-                                        if hasattr(model, 'best_params_') and thorough_training:
-                                            st.subheader("Best Parameters from Tuning")
-                                            st.json(model.best_params_)
-                                        
-                                    except Exception as e:
-                                        st.error(f"Error during training: {str(e)}")
-                                        st.exception(e)
-                                    finally:
-                                        # Clean up DuckDB connection
-                                        if 'con' in locals():
-                                            con.close()
+                    
+                    # Display loading state
+                    with st.spinner('Loading and processing data (this may take a while)...'):
+                        # Load data using memory-efficient method
+                        con = load_data(train_file)
+                        
+                        # Get column names and sample data for display
+                        columns = con.execute("DESCRIBE loan_data").fetchdf()['column_name'].tolist()
+                        sample_data = con.execute("SELECT * FROM loan_data LIMIT 5").fetchdf()
+                        
+                        # Clean and engineer features in chunks
+                        def process_chunk(chunk):
+                            chunk = clean_dataframe(chunk)
+                            return engineer_fraud_features(chunk)
+                        
+                        # Process data in chunks
+                        processed_data = process_data_chunked(con, process_chunk)
+                        
+                        # Get the updated column names after feature engineering
+                        sample_processed = process_chunk(sample_data)
+                        
+                        # Display data info
+                        st.subheader("Data Preview")
+                        st.write(f"Shape: {con.execute('SELECT COUNT(*) FROM loan_data').fetchone()[0]} rows, {len(sample_processed.columns)} columns")
+                        st.dataframe(sample_processed)
+                        
+                        # Model training options
+                        st.subheader("2. Model Training Options")
+                        thorough_training = st.checkbox("Enable thorough training (slower but more accurate)", 
+                                                     help="Uses RandomizedSearchCV for hyperparameter tuning")
+                        
+                        # Train button
+                        train_btn = st.button("Train Model")
+                        
+                        if train_btn:
+                            with st.spinner('Training model (this may take a while)...'):
+                                try:
+                                    # Get column names for features and target
+                                    y_col = 'is_default'
+                                    X_cols = [c for c in sample_processed.columns if c not in [y_col, 'borrower_id']]
+                                    
+                                    # Train model using chunked data
+                                    model = train_model_chunked(
+                                        con, 
+                                        X_cols, 
+                                        y_col, 
+                                        thorough_training=thorough_training
+                                    )
+                                    
+                                    # Save model
+                                    joblib.dump(model, 'fraud_detection_model.joblib')
+                                    st.success('Model trained and saved successfully!')
+                                    
+                                    # Display model info
+                                    if hasattr(model, 'best_params_') and thorough_training:
+                                        st.subheader("Best Parameters from Tuning")
+                                        st.json(model.best_params_)
+                                    
+                                except Exception as e:
+                                    st.error(f"Error during training: {str(e)}")
+                                    st.exception(e)
+                                finally:
+                                    # Clean up DuckDB connection
+                                    if 'con' in locals():
+                                        con.close()
                                             
                             prec, rec, _ = precision_recall_curve(y_val, y_proba_val)
                             fig_pr = go.Figure()
